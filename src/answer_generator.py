@@ -10,7 +10,7 @@ from typing import Any
 
 from groq import Groq
 
-_client: Groq | None = None
+_client: Groq = None
 
 
 def _get_client() -> Groq:
