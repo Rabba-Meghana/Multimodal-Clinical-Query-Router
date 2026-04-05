@@ -10,7 +10,7 @@ FUSED   → Cross-modal join across all three stores
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import chromadb
 import pandas as pd
@@ -18,11 +18,7 @@ from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
-# --------------------------------------------------------------------------- #
-#  ChromaDB client (in-memory for portability; swap to persistent for prod)   #
-# --------------------------------------------------------------------------- #
-
-_chroma_client: chromadb.Client | None = None
+_chroma_client: Optional[chromadb.Client] = None
 _notes_collection = None
 
 
@@ -66,13 +62,9 @@ def _load_notes_into_chroma():
         _notes_collection.upsert(ids=ids, documents=docs, metadatas=metas)
 
 
-# --------------------------------------------------------------------------- #
-#  Pandas dataframes (lazy-loaded)                                             #
-# --------------------------------------------------------------------------- #
-
-_labs_df: pd.DataFrame | None = None
-_genomic_df: pd.DataFrame | None = None
-_patients_df: pd.DataFrame | None = None
+_labs_df: Optional[pd.DataFrame] = None
+_genomic_df: Optional[pd.DataFrame] = None
+_patients_df: Optional[pd.DataFrame] = None
 
 
 def _get_labs() -> pd.DataFrame:
@@ -106,11 +98,7 @@ def _get_patients() -> pd.DataFrame:
     return _patients_df
 
 
-# --------------------------------------------------------------------------- #
-#  TEXT retriever                                                              #
-# --------------------------------------------------------------------------- #
-
-def retrieve_text(query: str, n_results: int = 5) -> list[dict[str, Any]]:
+def retrieve_text(query: str, n_results: int = 5) -> List[Dict[str, Any]]:
     """Semantic search over clinical notes via ChromaDB."""
     collection = _get_chroma()
     results = collection.query(
@@ -126,16 +114,12 @@ def retrieve_text(query: str, n_results: int = 5) -> list[dict[str, Any]]:
             "source": "clinical_notes",
             "patient_id": meta["patient_id"],
             "date": meta["date"],
-            "score": round(1 - dist, 4),  # cosine similarity
+            "score": round(1 - dist, 4),
             "snippet": doc[:600] + ("..." if len(doc) > 600 else ""),
             "metadata": meta,
         })
     return output
 
-
-# --------------------------------------------------------------------------- #
-#  LABS retriever                                                              #
-# --------------------------------------------------------------------------- #
 
 _METRIC_ALIASES = {
     "CRP": ["crp", "c-reactive protein", "c reactive protein"],
@@ -158,7 +142,7 @@ _OP_MAP = {
 }
 
 
-def _canonical_metric(text: str) -> str | None:
+def _canonical_metric(text: str) -> Optional[str]:
     text_l = text.lower()
     for canonical, aliases in _METRIC_ALIASES.items():
         if any(a in text_l for a in aliases):
@@ -166,14 +150,9 @@ def _canonical_metric(text: str) -> str | None:
     return None
 
 
-def retrieve_labs(query: str, filters: dict | None = None) -> list[dict[str, Any]]:
-    """
-    Filter lab time-series. Uses pre-extracted filters dict when available,
-    otherwise falls back to regex parsing of the query string.
-    """
+def retrieve_labs(query: str, filters: Optional[Dict] = None) -> List[Dict[str, Any]]:
     df = _get_labs().copy()
 
-    # Determine metric + threshold
     metric = None
     operator = None
     threshold = None
@@ -185,7 +164,6 @@ def retrieve_labs(query: str, filters: dict | None = None) -> list[dict[str, Any
         operator = _OP_MAP.get(operator_raw.lower().strip(), ">")
 
     if metric is None:
-        # Fallback regex
         m = re.search(
             r"\b(crp|wbc|hgb|hemoglobin|alt|ast|cea|ldh|creatinine|plt|platelets?)\b"
             r".{0,30}(above|below|greater than|less than|>|<|>=|<=|at least|at most)\s*(\d+\.?\d*)",
@@ -216,7 +194,6 @@ def retrieve_labs(query: str, filters: dict | None = None) -> list[dict[str, Any
                 },
             })
     else:
-        # No threshold → return latest visit per patient
         latest = df.sort_values("date").groupby("patient_id").last().reset_index()
         for _, row in latest.head(10).iterrows():
             results.append({
@@ -234,12 +211,7 @@ def retrieve_labs(query: str, filters: dict | None = None) -> list[dict[str, Any
     return results
 
 
-# --------------------------------------------------------------------------- #
-#  GENOMIC retriever                                                           #
-# --------------------------------------------------------------------------- #
-
-def retrieve_genomic(query: str, filters: dict | None = None) -> list[dict[str, Any]]:
-    """Filter genomic profiles by gene/variant/cancer type."""
+def retrieve_genomic(query: str, filters: Optional[Dict] = None) -> List[Dict[str, Any]]:
     df = _get_genomic().copy()
 
     genes = []
@@ -284,16 +256,7 @@ def retrieve_genomic(query: str, filters: dict | None = None) -> list[dict[str, 
     return results[:15]
 
 
-# --------------------------------------------------------------------------- #
-#  FUSED retriever                                                             #
-# --------------------------------------------------------------------------- #
-
-def retrieve_fused(query: str, filters: dict | None = None) -> list[dict[str, Any]]:
-    """
-    Cross-modal join: find patients satisfying conditions across notes + labs + genomics.
-    Returns merged patient-level records.
-    """
-    # Gather candidate patient IDs from each modality
+def retrieve_fused(query: str, filters: Optional[Dict] = None) -> List[Dict[str, Any]]:
     genomic_results = retrieve_genomic(query, filters)
     lab_results = retrieve_labs(query, filters)
     text_results = retrieve_text(query, n_results=8)
@@ -302,15 +265,13 @@ def retrieve_fused(query: str, filters: dict | None = None) -> list[dict[str, An
     lab_patients = {r["patient_id"] for r in lab_results}
     text_patients = {r["patient_id"] for r in text_results}
 
-    # Prefer intersection (all signals present), fall back to union
     all_patient_ids = genomic_patients | lab_patients | text_patients
     intersection = genomic_patients & lab_patients & text_patients
 
     priority_ids = intersection if intersection else (genomic_patients & lab_patients) or all_patient_ids
 
-    # Build merged patient records
     genomic_map = {r["patient_id"]: r for r in genomic_results}
-    lab_map: dict = {}
+    lab_map: Dict = {}
     for r in lab_results:
         if r["patient_id"] not in lab_map:
             lab_map[r["patient_id"]] = r
@@ -318,7 +279,7 @@ def retrieve_fused(query: str, filters: dict | None = None) -> list[dict[str, An
 
     merged = []
     for pid in list(priority_ids)[:10]:
-        record: dict[str, Any] = {"patient_id": pid, "sources": []}
+        record: Dict[str, Any] = {"patient_id": pid, "sources": []}
         if pid in genomic_map:
             record["genomic"] = genomic_map[pid]
             record["sources"].append("genomic")
